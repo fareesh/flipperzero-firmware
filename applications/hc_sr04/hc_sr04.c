@@ -8,6 +8,9 @@
 #include <input/input.h>
 #include <stdlib.h>
 #include <gui/elements.h>
+#include <string.h>
+#include <inttypes.h>
+
 
 typedef enum {
     EventTypeTick,
@@ -20,191 +23,154 @@ typedef struct {
 } PluginEvent;
 
 typedef struct {
-    bool have_5v;
-    bool measurement_made;
-    uint32_t echo; // ms
-    float distance; // meters
+    bool        have_5v;
+    bool        measurement_made;
+    uint32_t    echo_ms;            // echo pulse length in ms (1 tick resolution)
+    float       distance_m;         // calculated distance in metres
+    FuriMutex*  mutex;              // NEW: protects this struct
 } PluginState;
 
-static void render_callback(Canvas* const canvas, void* ctx) {
-    const PluginState* plugin_state = acquire_mutex((ValueMutex*)ctx, 25);
-    if(plugin_state == NULL) {
-        return;
-    }
-    // border around the edge of the screen
-    // canvas_draw_frame(canvas, 0, 0, 128, 64);
+static inline float ms_to_m(uint32_t ms) {
+    const float speed = 343.0f;                // m / s @ 20 °C
+    return (ms * 0.001f * speed) * 0.5f;       // go-&-return
+}
+
+static void render_cb(Canvas* canvas, void* ctx) {
+    PluginState* st = ctx;
+    if(furi_mutex_acquire(st->mutex, 25) != FuriStatusOk) return;
 
     canvas_set_font(canvas, FontPrimary);
-    elements_multiline_text_aligned(canvas, 64, 2, AlignCenter, AlignTop, "HC-SR04 Ultrasonic\nDistance Sensor");
+    elements_multiline_text_aligned(
+        canvas, 64, 2, AlignCenter, AlignTop,
+        "HC-SR04 Ultrasonic\nDistance Sensor");
 
     canvas_set_font(canvas, FontSecondary);
-
-    if (!plugin_state->have_5v) {
-        elements_multiline_text_aligned(canvas, 4, 28, AlignLeft, AlignTop, "5V on GPIO must be\nenabled, or USB must\nbe connected.");
+    if(!st->have_5v) {
+        elements_multiline_text_aligned(
+            canvas, 4, 28, AlignLeft, AlignTop,
+            "5 V on GPIO must be\nenabled, or USB must\nbe connected.");
+    } else if(!st->measurement_made) {
+        elements_multiline_text_aligned(
+            canvas, 64, 28, AlignCenter, AlignTop,
+            "Press centre button\nto measure");
     } else {
-        if (!plugin_state->measurement_made) {
-            elements_multiline_text_aligned(canvas, 64, 28, AlignCenter, AlignTop, "Press center button\nto measure");
-        } else {
-            elements_multiline_text_aligned(canvas, 4, 28, AlignLeft, AlignTop, "Readout:");
+        elements_multiline_text_aligned(canvas, 4, 28, AlignLeft, AlignTop, "Readout:");
 
-            string_t str_buf;
-            string_init(str_buf);
-            string_printf(str_buf, "Echo: %d ms", plugin_state->echo);
-            
-            canvas_draw_str_aligned(canvas, 8, 38, AlignLeft, AlignTop, string_get_cstr(str_buf));
-            string_printf(str_buf, "Distance: %02f m", (double)plugin_state->distance);
-            canvas_draw_str_aligned(canvas, 8, 48, AlignLeft, AlignTop, string_get_cstr(str_buf));
-        
-            string_clear(str_buf);
-        }
+        FuriString* s = furi_string_alloc();
+        furi_string_printf(s, "Echo: %" PRIu32 " ms", (uint32_t)st->echo_ms);
+
+        canvas_draw_str_aligned(canvas, 8, 38, AlignLeft, AlignTop, furi_string_get_cstr(s));
+
+        furi_string_printf(s, "Distance: %.2f m", (double)st->distance_m);
+
+        canvas_draw_str_aligned(canvas, 8, 48, AlignLeft, AlignTop, furi_string_get_cstr(s));
+        furi_string_free(s);
     }
 
-    release_mutex((ValueMutex*)ctx, plugin_state);
+    furi_mutex_release(st->mutex);
 }
 
-static void input_callback(InputEvent* input_event, FuriMessageQueue* event_queue) {
-    furi_assert(event_queue);
-
-    PluginEvent event = {.type = EventTypeKey, .input = *input_event};
-    furi_message_queue_put(event_queue, &event, FuriWaitForever);
+static void input_cb(InputEvent* ev, void* ctx) {
+    FuriMessageQueue* q = ctx;
+    PluginEvent e      = {.type = EventTypeKey, .input = *ev};
+    furi_message_queue_put(q, &e, FuriWaitForever);
 }
 
-static void hc_sr04_state_init(PluginState* const plugin_state) {
-    plugin_state->echo = -1;
-    plugin_state->distance = -1;
-    plugin_state->measurement_made = false;
-
-    plugin_state->have_5v = false;
-    if (furi_hal_power_is_otg_enabled() || furi_hal_power_is_charging()) {
-        plugin_state->have_5v = true;
-    }
-}
-
-float hc_sr04_ms_to_m(uint32_t ms) {
-    const float speed_sound_m_per_s = 343.0f;
-    const float time_s = ms / 1e3f;
-    const float total_dist = time_s * speed_sound_m_per_s;
-    return total_dist / 2.0f;
-}
-
-static void hc_sr04_measure(PluginState* const plugin_state) {
-    //plugin_state->echo = 1;
-    //return;
-
-    if (!plugin_state->have_5v) {
-        if (furi_hal_power_is_otg_enabled() || furi_hal_power_is_charging()) {
-            plugin_state->have_5v = true;
-        } else {
-            return;
-        }
+static void hc_sr04_measure(PluginState* st) {
+    if(!st->have_5v) {
+        st->have_5v =
+            (furi_hal_power_is_otg_enabled() || furi_hal_power_is_charging());
+        if(!st->have_5v) return;
     }
 
     furi_hal_light_set(LightRed, 0xFF);
 
     const uint32_t timeout_ms = 2000;
-    // Pin 13 / TX -> Trig
-    furi_hal_gpio_write(&gpio_usart_tx, false);
-    furi_hal_gpio_init(&gpio_usart_tx, GpioModeOutputPushPull, GpioPullNo, GpioSpeedVeryHigh);
 
-    // Pin 14 / RX -> Echo
-    furi_hal_gpio_write(&gpio_usart_rx, false);
-    furi_hal_gpio_init(&gpio_usart_rx, GpioModeInput, GpioPullNo, GpioSpeedVeryHigh);
+    furi_hal_gpio_write(&gpio_usart_tx, false);  // Trig low
+    furi_hal_gpio_init(
+        &gpio_usart_tx, GpioModeOutputPushPull, GpioPullNo, GpioSpeedVeryHigh);
 
-    //FURI_CRITICAL_ENTER();
-    // 10 ms pulse on TX
+    furi_hal_gpio_init(
+        &gpio_usart_rx, GpioModeInput, GpioPullNo, GpioSpeedVeryHigh);
+
     furi_hal_gpio_write(&gpio_usart_tx, true);
-    furi_delay_ms(10);
+    furi_delay_us(10);
     furi_hal_gpio_write(&gpio_usart_tx, false);
-
-    // TODO change from furi_get_tick(), which returns ms,
-    // to DWT->CYCCNT, which is a more precise counter with
-    // us precision (see furi_hal_cortex_delay_us)
 
     const uint32_t start = furi_get_tick();
 
-    while (furi_get_tick() - start < timeout_ms && furi_hal_gpio_read(&gpio_usart_rx))
+    while((furi_get_tick() - start) < timeout_ms && furi_hal_gpio_read(&gpio_usart_rx))
         ;
-    while (furi_get_tick() - start < timeout_ms && !furi_hal_gpio_read(&gpio_usart_rx))
+    while((furi_get_tick() - start) < timeout_ms && !furi_hal_gpio_read(&gpio_usart_rx))
         ;
 
     const uint32_t pulse_start = furi_get_tick();
 
-    while (furi_get_tick() - start < timeout_ms && furi_hal_gpio_read(&gpio_usart_rx))
+    while((furi_get_tick() - start) < timeout_ms && furi_hal_gpio_read(&gpio_usart_rx))
         ;
-    
-    const uint32_t pulse_end = furi_get_tick();
-    //FURI_CRITICAL_EXIT();
 
-    plugin_state->echo = pulse_end - pulse_start;
-    plugin_state->distance = hc_sr04_ms_to_m(pulse_end - pulse_start);
-    plugin_state->measurement_made = true;
+    const uint32_t pulse_end = furi_get_tick();
+
+    st->echo_ms         = pulse_end - pulse_start;
+    st->distance_m      = ms_to_m(st->echo_ms);
+    st->measurement_made = true;
 
     furi_hal_light_set(LightRed, 0x00);
 }
 
-int32_t hc_sr04_app() {
-    FuriMessageQueue* event_queue = furi_message_queue_alloc(8, sizeof(PluginEvent));
+int32_t hc_sr04_app(void* p) {
+    UNUSED(p);
+    srand(furi_get_tick());
 
-    PluginState* plugin_state = malloc(sizeof(PluginState));
+    PluginState state = {
+        .have_5v          = furi_hal_power_is_otg_enabled() || furi_hal_power_is_charging(),
+        .measurement_made = false,
+        .echo_ms          = 0,
+        .distance_m       = 0.0f,
+        .mutex            = furi_mutex_alloc(FuriMutexTypeRecursive),
+    };
+    if(!state.mutex) return 255;
 
-    hc_sr04_state_init(plugin_state);
+    FuriMessageQueue* queue = furi_message_queue_alloc(8, sizeof(PluginEvent));
 
-    ValueMutex state_mutex;
-    if(!init_mutex(&state_mutex, plugin_state, sizeof(PluginState))) {
-        FURI_LOG_E("hc_sr04", "cannot create mutex\r\n");
-        free(plugin_state);
-        return 255;
-    }
+    ViewPort* vp = view_port_alloc();
+    view_port_draw_callback_set(vp, render_cb, &state);
+    view_port_input_callback_set(vp, input_cb, queue);
 
-    // Set system callbacks
-    ViewPort* view_port = view_port_alloc();
-    view_port_draw_callback_set(view_port, render_callback, &state_mutex);
-    view_port_input_callback_set(view_port, input_callback, event_queue);
-
-    // Open GUI and register view_port
-    Gui* gui = furi_record_open("gui");
-    gui_add_view_port(gui, view_port, GuiLayerFullscreen);
+    Gui* gui = furi_record_open(RECORD_GUI);
+    gui_add_view_port(gui, vp, GuiLayerFullscreen);
 
     PluginEvent event;
-    for(bool processing = true; processing;) {
-        FuriStatus event_status = furi_message_queue_get(event_queue, &event, 100);
+    for(bool running = true; running;) {
+        const FuriStatus s = furi_message_queue_get(queue, &event, 100);
 
-        PluginState* plugin_state = (PluginState*)acquire_mutex_block(&state_mutex);
+        furi_mutex_acquire(state.mutex, FuriWaitForever);
 
-        if(event_status == FuriStatusOk) {
-            // press events
-            if(event.type == EventTypeKey) {
-                if(event.input.type == InputTypePress) {
-                    switch(event.input.key) {
-                    case InputKeyUp:
-                    case InputKeyDown:
-                    case InputKeyRight:
-                    case InputKeyLeft:
-                        break;
-                    case InputKeyOk:
-                        hc_sr04_measure(plugin_state);
-                        break;
-                    case InputKeyBack:
-                        processing = false;
-                        break;
-                    }
-                }
+        if(s == FuriStatusOk && event.type == EventTypeKey &&
+           event.input.type == InputTypePress) {
+            switch(event.input.key) {
+            case InputKeyOk:
+                hc_sr04_measure(&state);
+                break;
+            case InputKeyBack:
+                running = false;
+                break;
+            default:;
             }
-        } else {
-            FURI_LOG_D("hc_sr04", "FuriMessageQueue: event timeout");
-            // event timeout
         }
 
-        view_port_update(view_port);
-        release_mutex(&state_mutex, plugin_state);
+        furi_mutex_release(state.mutex);
+        view_port_update(vp);
     }
 
-    view_port_enabled_set(view_port, false);
-    gui_remove_view_port(gui, view_port);
-    furi_record_close("gui");
-    view_port_free(view_port);
-    furi_message_queue_free(event_queue);
-    delete_mutex(&state_mutex);
+    view_port_enabled_set(vp, false);
+    gui_remove_view_port(gui, vp);
+    furi_record_close(RECORD_GUI);
+    view_port_free(vp);
+
+    furi_message_queue_free(queue);
+    furi_mutex_free(state.mutex);
 
     return 0;
 }
